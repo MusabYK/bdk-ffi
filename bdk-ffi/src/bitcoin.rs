@@ -217,6 +217,7 @@ impl_into_core_type!(FeeRate, BdkFeeRate);
 /// underflow occurs. Also note that since the internal representation of amounts is unsigned,
 /// subtracting below zero is considered an underflow and will cause a panic.
 #[derive(Debug, Clone, PartialEq, Eq, uniffi::Object)]
+#[uniffi::export(Display)]
 pub struct Amount(pub(crate) BdkAmount);
 
 #[uniffi::export]
@@ -248,6 +249,12 @@ impl Amount {
 
 impl_from_core_type!(BdkAmount, Amount);
 impl_into_core_type!(Amount, BdkAmount);
+
+impl Display for Amount {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
 
 /// A bitcoin script: https://en.bitcoin.it/wiki/Script
 #[derive(Clone, Debug, uniffi::Object)]
@@ -1389,6 +1396,7 @@ impl From<&BdkOutput> for Output {
 
 /// A Partially Signed Transaction.
 #[derive(uniffi::Object)]
+#[uniffi::export(Display)]
 pub struct Psbt(pub(crate) Mutex<BdkPsbt>);
 
 #[uniffi::export]
@@ -1529,6 +1537,12 @@ impl Psbt {
 impl From<BdkPsbt> for Psbt {
     fn from(psbt: BdkPsbt) -> Self {
         Psbt(Mutex::new(psbt))
+    }
+}
+
+impl Display for Psbt {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        write!(f, "{}", self.0.lock().unwrap())
     }
 }
 

@@ -23,6 +23,12 @@ bdk_kyoto = { version = "0.17.0" }
 uniffi = { version = "=0.31.2", features = ["cli"]}
 thiserror = "2.0.17"
 
+# BIP-352 Silent Payments support
+sp_lib = { git      = "https://github.com/cygnet3/spdk", package  = "silentpayments", rev = "400abde104f2edd7130f2a7286170cd7fc17d121", features = ["receiving", "sending", "encode"] }
+bitcoin_hashes = "0.14"
+secp256k1 = { version = "0.29.0", features = ["rand", "global-context", "rand-std"] }
+hex = "0.4"
+
 [build-dependencies]
 uniffi = { version = "=0.31.2", features = ["build"] }
 

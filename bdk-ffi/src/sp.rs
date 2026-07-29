@@ -416,6 +416,68 @@ pub fn compute_sender_tweak_data(inputs: Vec<SendingInput>) -> Result<String, Si
     Ok(hex::encode(tweak_pubkey.serialize()))
 }
 
+/// A discovered SP output with its derived spending key.
+///
+/// Can only be constructed via `SilentPaymentRecipient.derive_spending_key`
+/// (or its batch form) or `from_hex` — both enforce that spending_key and
+/// output_pubkey actually correspond.
+#[derive(uniffi::Object)]
+pub struct SpendableOutput {
+    /// Raw secp256k1 private key (32 bytes, hex, 64 chars).
+    /// spending_key = b_spend + [label_scalar] + t_k
+    pub spending_key: SecretKey,
+
+    /// 33-byte compressed output pubkey (02/03 + x, 66 hex chars).
+    /// P2TR scriptPubKey = 0x51 0x20 <output_pubkey_hex bytes [1..]>
+    pub output_pubkey: PublicKey,
+}
+
+#[uniffi::export]
+impl SpendableOutput {
+    /// Reconstruct from previously-persisted hex — e.g. after an app
+    /// restart, if spending_key_hex/output_pubkey_hex were saved directly
+    /// rather than re-deriving from a stored tweak_hex + label. Verifies
+    /// the correspondence at construction time, same as the derive path.
+    ///
+    /// Prefer persisting `(tweak_hex, label)` and re-deriving via
+    /// `derive_spending_key` where possible — it avoids holding a raw
+    /// spendable private key in storage at all until the moment it's
+    /// actually needed.
+    ///
+    /// # Arguments
+    /// * `spending_key_hex`    — The derived spending key for this output (32 bytes, hex, 64 chars).
+    /// * `output_pubkey_hex`  — The P2TR output pubkey to check against.
+    #[uniffi::constructor]
+    pub fn from_hex(
+        spending_key_hex: String,
+        output_pubkey_hex: String,
+    ) -> Result<Self, SilentPaymentError> {
+        let spending_key = parse_secret_key_hex(&spending_key_hex)?;
+        let output_pubkey = parse_pubkey_33(&output_pubkey_hex)?;
+
+        let secp = Secp256k1::new();
+        let derived_pubkey = PublicKey::from_secret_key(&secp, &spending_key);
+        if derived_pubkey != output_pubkey {
+            return Err(SilentPaymentError::InvalidKey {
+                msg: "spending_key_hex does not correspond to output_pubkey_hex".into(),
+            });
+        }
+
+        Ok(Self {
+            spending_key,
+            output_pubkey,
+        })
+    }
+
+    pub fn spending_key_hex(&self) -> String {
+        hex::encode(self.spending_key.secret_bytes())
+    }
+
+    pub fn output_pubkey_hex(&self) -> String {
+        hex::encode(self.output_pubkey.serialize())
+    }
+}
+
 /// Full BIP-352 keypair (scan secret + spend secret).
 /// Generates SP addresses, derive labeled sub-addresses, export keys
 /// for SilentPaymentScanner.
@@ -653,6 +715,61 @@ impl SilentPaymentRecipient {
     pub fn export_spend_pubkey_hex(&self) -> String {
         hex::encode(self.spend_public.serialize())
     }
+
+    /// Derive the private(spending) key needed to spend a discovered Silent Payment output (FoundPayment).
+    ///
+    /// # BIP-352 derivation
+    /// Unlabeled: spending_key = b_spend + t_k
+    /// Labeled m: spending_key = b_spend + H_BIP0352/Label(b_scan || m) + t_k
+    pub fn derive_spending_key(
+        &self,
+        payment: FoundPayment,
+    ) -> Result<Arc<SpendableOutput>, SilentPaymentError> {
+        let t_k_scalar =
+            Scalar::from_be_bytes(hex_to_32_bytes(&payment.tweak_hex)?).map_err(|_| {
+                SilentPaymentError::CryptoError {
+                    msg: "tweak_hex is not a valid secp256k1 scalar (0 < t_k < n required)".into(),
+                }
+            })?;
+
+        let mut key = self.spend_secret;
+        if let Some(m) = payment.label {
+            let label_scalar = compute_label_scalar(&self.scan_secret, m)?;
+            key = key
+                .add_tweak(&label_scalar)
+                .map_err(|e| SilentPaymentError::CryptoError {
+                    msg: format!("Label {m} scalar addition failed: {e}"),
+                })?;
+        }
+        key = key
+            .add_tweak(&t_k_scalar)
+            .map_err(|e| SilentPaymentError::CryptoError {
+                msg: format!("t_k scalar addition failed: {e}"),
+            })?;
+
+        let secp = Secp256k1::new();
+        let output_pubkey = PublicKey::from_secret_key(&secp, &key);
+
+        Ok(Arc::new(SpendableOutput {
+            spending_key: key,
+            output_pubkey,
+        }))
+    }
+
+    /// Batch version. Takes `Vec<FoundPayment>` directly.
+    ///
+    /// Batch-derive spending keys for multiple discovered payments.
+    /// Equivalent to calling derive_spending_key in a loop but in one FFI call.
+    /// Useful at wallet startup when restoring many historical payments.
+    pub fn derive_spending_keys_batch(
+        &self,
+        payments: Vec<FoundPayment>,
+    ) -> Result<Vec<Arc<SpendableOutput>>, SilentPaymentError> {
+        payments
+            .into_iter()
+            .map(|p| self.derive_spending_key(p))
+            .collect()
+    }
 }
 
 /// Watch-only BIP-352 scanner. This holds scan secret + spend pubkey only.
@@ -888,6 +1005,8 @@ impl SilentPaymentScanner {
     }
 }
 
+// HELPERS
+
 /// t_k = H_BIP0352/SharedSecret(compressed_ecdh_point || k.to_be_bytes())
 fn compute_t_n(ecdh_pubkey: &PublicKey, k: u32) -> Result<SecretKey, SilentPaymentError> {
     let mut engine = SpSharedSecretHash::engine();
@@ -923,8 +1042,30 @@ fn compute_label_pubkey(b_scan: &SecretKey, m: u32) -> Result<PublicKey, SilentP
     Ok(PublicKey::from_secret_key(&secp, &label_scalar))
 }
 
-// HELPERS
+/// Compute H_BIP0352/Label(b_scan || m) as a Scalar for key addition.
+/// Separate from compute_label_pubkey which returns PublicKey.
+fn compute_label_scalar(b_scan: &SecretKey, m: u32) -> Result<Scalar, SilentPaymentError> {
+    let mut engine = BIP0352LabelHash::engine();
+    engine.input(&b_scan.secret_bytes());
+    engine.input(&m.to_be_bytes());
+    let hash = BIP0352LabelHash::from_engine(engine).to_byte_array();
 
+    // Validate as SecretKey first (checks non-zero and < n)
+    let label_sk = SecretKey::from_slice(&hash).map_err(|e| SilentPaymentError::CryptoError {
+        msg: format!("Label {m} hash is an invalid scalar: {e}"),
+    })?;
+
+    Scalar::from_be_bytes(label_sk.secret_bytes()).map_err(|_| SilentPaymentError::CryptoError {
+        msg: format!("Label {m} hash out of scalar range"),
+    })
+}
+
+/// Parse a 32-byte hex string into a secp256k1 SecretKey.
+fn parse_secret_key_hex(s: &str) -> Result<SecretKey, SilentPaymentError> {
+    SecretKey::from_slice(&hex_to_32_bytes(s)?).map_err(|e| SilentPaymentError::InvalidKey {
+        msg: format!("Invalid secp256k1 secret key: {e}"),
+    })
+}
 /// Run ECDH and convert the raw 64-byte output to a compressed PublicKey.
 /// shared_secret_point returns (x,y) without a prefix byte; we reconstruct
 /// the full uncompressed form (0x04 || x || y) before parsing.

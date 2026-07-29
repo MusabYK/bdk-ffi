@@ -1,14 +1,10 @@
 use std::convert::{TryFrom, TryInto};
 use std::sync::Arc;
 
-// block-style sha256t_hash_newtype!
-// spdk defines SpSharedSecretHash and BIP0352LabelHash as pub(crate), so we
-// re-implement them with identical tags. This is safe, same math, same output.
 use bitcoin_hashes::{sha256t_hash_newtype, Hash, HashEngine};
 use secp256k1::{ecdh::shared_secret_point, PublicKey, Scalar, Secp256k1, SecretKey};
 
 use bdk_wallet::bitcoin::Network;
-// sp_lib = the silentpayments crate (aliased to avoid name collision)
 use sp_lib::{
     utils::{sending::calculate_partial_secret, OutPoint as SpOutPoint},
     Network as SpNetwork, SilentPaymentAddress as SpAddress, SpVersion,
@@ -76,12 +72,6 @@ pub struct SilentPaymentAddress {
     pub spend_pubkey_hex: String,
     /// Which network this address is valid for (bdk_wallet::bitcoin::Network).
     pub network: Network,
-}
-
-/// Wraps a hex-encoded value (key bytes, tweak scalars, addresses).
-#[derive(uniffi::Record, Debug, Clone)]
-pub struct HexStringResult {
-    pub value: String,
 }
 
 /// A payment found during transaction scanning.
@@ -272,40 +262,12 @@ pub fn create_silent_payment_outputs(
     Ok(outputs)
 }
 
-/// Build the tsp1q.../sp1q... address from the keys stored in the scanner.
-/// Used to form the server-side subscription parameters (without needing the spend secret).
-/// In Frigate for example, this is used to generate the sp1q... address.
-#[uniffi::export]
-pub fn build_sp_address(
-    scan_secret_hex: String,
-    spend_pubkey_hex: String,
-    network: Network,
-) -> Result<HexStringResult, SilentPaymentError> {
-    let secp = Secp256k1::new();
-    let scan_secret = SecretKey::from_slice(&hex_to_32_bytes(&scan_secret_hex)?)
-        .map_err(|e| SilentPaymentError::InvalidKey { msg: e.to_string() })?;
-    let scan_public = PublicKey::from_secret_key(&secp, &scan_secret);
-    let spend_public = PublicKey::from_slice(&hex_to_33_bytes(&spend_pubkey_hex)?)
-        .map_err(|e| SilentPaymentError::InvalidKey { msg: e.to_string() })?;
-
-    let sp_addr = SpAddress::new(
-        scan_public,
-        spend_public,
-        to_sp_network(&network),
-        SpVersion::ZERO,
-    );
-    let address: String = sp_addr.into();
-    Ok(HexStringResult { value: address })
-}
-
 /// Compute the tweak data (33-byte compressed pubkey) a Frigate-equivalent server would serve.
 /// Mathematical identity: tweak_data = partial_secret × G = (a_sum × input_hash) × G = a_sum × (input_hash × G) = A_sum × input_hash. This is the tweak data
 /// In production: the tweak index server computes and caches this.
 /// In tests/demos: use this to bridge send and scan without a server.
 #[uniffi::export]
-pub fn compute_sender_tweak_data(
-    inputs: Vec<SendingInput>,
-) -> Result<HexStringResult, SilentPaymentError> {
+pub fn compute_sender_tweak_data(inputs: Vec<SendingInput>) -> Result<String, SilentPaymentError> {
     if inputs.is_empty() {
         return Err(SilentPaymentError::InvalidKey {
             msg: "inputs must not be empty".into(),
@@ -335,9 +297,7 @@ pub fn compute_sender_tweak_data(
     // This is the public key the mobile scanner receives from the index server
     let secp = Secp256k1::new();
     let tweak_pubkey = PublicKey::from_secret_key(&secp, &partial_scalar);
-    Ok(HexStringResult {
-        value: hex::encode(tweak_pubkey.serialize()),
-    })
+    Ok(hex::encode(tweak_pubkey.serialize()))
 }
 
 /// Full BIP-352 keypair (scan secret + spend secret).
@@ -471,26 +431,20 @@ impl SilentPaymentRecipient {
 
     /// Scan private key hex. Pass to Frigate subscribe(scanSecretHex: ...).
     /// NOTE: This is private. Store in secure_storage.
-    pub fn export_scan_secret_hex(&self) -> HexStringResult {
-        HexStringResult {
-            value: hex::encode(self.scan_secret.secret_bytes()),
-        }
+    pub fn export_scan_secret_hex(&self) -> String {
+        hex::encode(self.scan_secret.secret_bytes())
     }
 
     /// Spend private key hex. Needed to sign SP output spending transactions.
     /// NOTE: This is private. Store in secure_storage.
-    pub fn export_spend_secret_hex(&self) -> HexStringResult {
-        HexStringResult {
-            value: hex::encode(self.spend_secret.secret_bytes()),
-        }
+    pub fn export_spend_secret_hex(&self) -> String {
+        hex::encode(self.spend_secret.secret_bytes())
     }
 
     /// Spend PUBLIC key hex. Safe to share with Frigate.
     /// Pass to Frigate subscribe(spendPubkeyHex: ...).
-    pub fn export_spend_pubkey_hex(&self) -> HexStringResult {
-        HexStringResult {
-            value: hex::encode(self.spend_public.serialize()),
-        }
+    pub fn export_spend_pubkey_hex(&self) -> String {
+        hex::encode(self.spend_public.serialize())
     }
 }
 
@@ -499,6 +453,7 @@ impl SilentPaymentRecipient {
 #[derive(uniffi::Object)]
 pub struct SilentPaymentScanner {
     scan_secret: SecretKey,
+    scan_public: PublicKey,
     spend_public: PublicKey,
 }
 
@@ -523,10 +478,31 @@ impl SilentPaymentScanner {
                     msg: format!("Invalid spend pubkey: {e}"),
                 }
             })?;
+        let secp = Secp256k1::new();
+        let scan_public = PublicKey::from_secret_key(&secp, &scan_secret);
         Ok(Arc::new(Self {
             scan_secret,
+            scan_public,
             spend_public,
         }))
+    }
+
+    /// Build the tsp1q.../sp1q... address from the keys stored in the scanner.
+    /// Used to form the server-side subscription parameters (without needing the spend secret).
+    /// In Frigate for example, this is used to generate the sp1q... address.
+    pub fn get_address(&self, network: Network) -> SilentPaymentAddress {
+        let sp_addr = SpAddress::new(
+            self.scan_public,
+            self.spend_public,
+            to_sp_network(&network),
+            SpVersion::ZERO,
+        );
+        SilentPaymentAddress {
+            address: sp_addr.into(),
+            scan_pubkey_hex: hex::encode(self.scan_public.serialize()),
+            spend_pubkey_hex: hex::encode(self.spend_public.serialize()),
+            network,
+        }
     }
 
     /// Scan a transaction for SP payments using pre-computed tweak data.

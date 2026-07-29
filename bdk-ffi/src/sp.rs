@@ -10,6 +10,14 @@ use sp_lib::{
     Network as SpNetwork, SilentPaymentAddress as SpAddress, SpVersion,
 };
 
+use crate::bitcoin::NetworkKind;
+use crate::descriptor::Descriptor;
+use crate::error::{Bip32Error, Bip39Error, DescriptorKeyError};
+use crate::keys::{DerivationPath, DescriptorSecretKey, Mnemonic};
+
+// Only needed now for the internal root-safety check (origin/depth inspection).
+use bdk_wallet::keys::DescriptorSecretKey as BdkDescriptorSecretKey;
+
 // BIP-352 Tagged Hashes
 // spdk defines SpSharedSecretHash and BIP0352LabelHash as pub(crate), so we
 // re-implement them with identical tags. This is safe, same math, same output.
@@ -25,13 +33,26 @@ sha256t_hash_newtype! {
     struct BIP0352LabelHash(_);
 }
 
-/// Convert bitcoin::Network → sp_lib::Network (for address encoding).
-/// BIP-352: testnet AND signet both use "tsp" HRP — both map to SpNetwork::Testnet.
+/// BIP-352: testnet AND signet both use "tsp" HRP - both map to SpNetwork::Testnet.
 fn to_sp_network(network: &Network) -> SpNetwork {
     match network {
         Network::Bitcoin => SpNetwork::Mainnet,
         Network::Testnet | Network::Testnet4 | Network::Signet => SpNetwork::Testnet,
         Network::Regtest => SpNetwork::Regtest,
+    }
+}
+
+fn to_network_kind(network: &Network) -> NetworkKind {
+    match network {
+        Network::Bitcoin => NetworkKind::Main,
+        _ => NetworkKind::Test,
+    }
+}
+
+fn bip352_coin_type(network: &Network) -> u32 {
+    match network {
+        Network::Bitcoin => 0,
+        _ => 1,
     }
 }
 
@@ -58,6 +79,28 @@ impl From<secp256k1::Error> for SilentPaymentError {
         SilentPaymentError::CryptoError { msg: e.to_string() }
     }
 }
+// DescriptorSecretKey::derive() and DerivationPath::new() surface these directly.
+impl From<DescriptorKeyError> for SilentPaymentError {
+    fn from(e: DescriptorKeyError) -> Self {
+        SilentPaymentError::CryptoError {
+            msg: format!("Key derivation failed: {e}"),
+        }
+    }
+}
+impl From<Bip32Error> for SilentPaymentError {
+    fn from(e: Bip32Error) -> Self {
+        SilentPaymentError::CryptoError {
+            msg: format!("Invalid derivation path: {e}"),
+        }
+    }
+}
+impl From<Bip39Error> for SilentPaymentError {
+    fn from(e: Bip39Error) -> Self {
+        SilentPaymentError::InvalidKey {
+            msg: format!("Invalid BIP-39 mnemonic: {e}"),
+        }
+    }
+}
 
 /// A BIP-352 Silent Payment address with component public keys.
 /// sp1q... (mainnet) or tsp1q... (testnet/signet) — bech32m encoded.
@@ -75,21 +118,17 @@ pub struct SilentPaymentAddress {
 }
 
 /// A payment found during transaction scanning.
-/// Store tweak_hex — you MUST have it to spend the output (Phase 2).
+/// Store tweak_hex — you MUST have it to spend the silent payment output
 #[derive(uniffi::Record, Debug, Clone)]
 pub struct FoundPayment {
     /// vout index in the transaction.
     pub output_index: u32,
     /// 32-byte tweak scalar (hex, 64 chars). STORE THIS — needed for spending.
-    /// Phase 2 will add: spend_key = spend_secret + H(b_scan × tweak_point || k)
     pub tweak_hex: String,
     /// Output value in satoshis. Caller fills this from transaction data.
     pub amount_sats: u64,
-    /// None = standard address. Some(m) = labeled sub-address m.
-    /// Eg:
-    ///   Some(1)  → donations
-    ///   Some(2)  → shop payments
-    ///   etc.
+    /// None = standard address. Some(m) = labeled sub-address m where m is positive integer greater 0 > (1..2^32-1).
+    /// Eg: Some(1)  → donations Some(2)  → shop payments etc.
     pub label: Option<u32>,
 }
 
@@ -114,7 +153,6 @@ pub struct PaymentRecipient {
 }
 
 /// One input spent in a SP transaction. Requires the raw private key.
-/// Phase 3 will add BDK-integrated sending that derives keys internally.
 /// BIP-352 requires:
 ///   * ALL eligible input private keys (P2PKH, P2WPKH, P2SH-P2WPKH, P2TR)
 ///   * The corresponding outpoints (txid + vout) for the input hash
@@ -129,6 +167,84 @@ pub struct SendingInput {
     pub txid: String,
     /// Output index of the UTXO (the "n" in txid:n)
     pub vout: u32,
+}
+
+// Root-key safety check + derivation
+
+/// Verify a raw BdkDescriptorSecretKey is genuinely root-level before it's
+/// used for BIP-352 derivation.
+///
+/// `.derive()` itself performs no such check, it will happily derive
+/// further from an already-derived key, silently producing an address with
+/// no relationship to the wallet it appears to come from. This check exists
+/// because from_descriptor accepts keys that may have been reloaded
+/// from storage already-derived. key derivation is expected to pass a
+/// fresh root key, but the check costs nothing to apply uniformly.
+///
+/// A fresh key from `DescriptorSecretKey::new(...)` has `origin: None` and
+/// `xkey.depth == 0`. If the key has been derived, `origin` becomes `Some(...)` and
+/// and `xkey.depth` advances, even though `derivation_path` itself gets reset to empty.
+fn ensure_root_level(bdk_secret_key: &BdkDescriptorSecretKey) -> Result<(), SilentPaymentError> {
+    match bdk_secret_key {
+        BdkDescriptorSecretKey::XPrv(descriptor_x_key) => {
+            if descriptor_x_key.origin.is_some() {
+                return Err(SilentPaymentError::InvalidKey {
+                    msg: "Key carries origin/fingerprint metadata — it has already \
+                          been derived away from its root. Silent Payments must \
+                          derive from the SAME root as your BDK wallet: pass the \
+                          DescriptorSecretKey from DescriptorSecretKey::new(...) \
+                          directly, before any BIP-84/BIP-86 derivation."
+                        .into(),
+                });
+            }
+            if descriptor_x_key.xkey.depth != 0 {
+                return Err(SilentPaymentError::InvalidKey {
+                    msg: format!(
+                        "Expected a root-level key (depth 0), found depth {}. \
+                         This key has already been derived and cannot be used \
+                         to reach a different BIP-352 branch of the same seed.",
+                        descriptor_x_key.xkey.depth
+                    ),
+                });
+            }
+            Ok(())
+        }
+        BdkDescriptorSecretKey::Single(_) => Err(SilentPaymentError::InvalidKey {
+            msg: "Silent Payments require an extended (xprv) key, not a single \
+                  non-extended key."
+                .into(),
+        }),
+        BdkDescriptorSecretKey::MultiXPrv(_) => Err(SilentPaymentError::InvalidKey {
+            msg: "Multi-path extended keys are not supported for Silent Payments.".into(),
+        }),
+    }
+}
+
+/// Derive BIP-352 scan + spend secp256k1 keys from a root DescriptorSecretKey,
+/// using bdk-ffi's own `.derive()` — twice, once per BIP-352 branch (Key type). No
+/// duplicate BIP-32 implementation; this calls straight into bdk's
+/// already-tested derivation code.
+fn derive_bip352_secret_keys(
+    root_key: &DescriptorSecretKey,
+    network: &Network,
+    account: u32,
+) -> Result<(SecretKey, SecretKey), SilentPaymentError> {
+    let coin_type = bip352_coin_type(network);
+
+    // m/352'/coin_type'/account'/0/0 — spend key
+    let spend_path = DerivationPath::new(format!("m/352h/{coin_type}h/{account}h/0/0"))?;
+    let spend_key = root_key.derive(&spend_path)?;
+
+    // m/352'/coin_type'/account'/1/0 — scan key
+    let scan_path = DerivationPath::new(format!("m/352h/{coin_type}h/{account}h/1/0"))?;
+    let scan_key = root_key.derive(&scan_path)?;
+
+    let spend_secret = SecretKey::from_slice(&spend_key.secret_bytes())
+        .map_err(|e| SilentPaymentError::InvalidKey { msg: e.to_string() })?;
+    let scan_secret = SecretKey::from_slice(&scan_key.secret_bytes())
+        .map_err(|e| SilentPaymentError::InvalidKey { msg: e.to_string() })?;
+
+    Ok((scan_secret, spend_secret))
 }
 
 /// Compute the BIP-352 compliant P2TR output pubkeys for a Silent Payment transaction.
@@ -332,6 +448,97 @@ impl SilentPaymentRecipient {
             spend_public,
             network,
         }))
+    }
+
+    /// Restore from a raw BIP-39 mnemonic phrase.
+    /// Thin wrapper over from_descriptor_secret_key — builds a root
+    /// DescriptorSecretKey via bdk-ffi's own Mnemonic type, then delegates.
+    #[uniffi::constructor]
+    pub fn from_mnemonic(
+        mnemonic_phrase: String,
+        network: Network,
+        account: u32,
+    ) -> Result<Self, SilentPaymentError> {
+        let mnemonic = Mnemonic::from_string(mnemonic_phrase)?;
+        let network_kind = to_network_kind(&network);
+        let root_key = DescriptorSecretKey::new(network_kind, &mnemonic, None);
+        Self::from_descriptor_secret_key(&root_key, network, account)
+    }
+    /// Restore from bdk-ffi's own root-level `DescriptorSecretKey` — the
+    /// same object obtained from `DescriptorSecretKey::new(...)`, used
+    /// BEFORE passing it to `Descriptor::new_bip84(...)`.
+    #[uniffi::constructor]
+    pub fn from_descriptor_secret_key(
+        root_key: &DescriptorSecretKey,
+        network: Network,
+        account: u32,
+    ) -> Result<Self, SilentPaymentError> {
+        ensure_root_level(&root_key.0)?;
+        let (scan_secret, spend_secret) = derive_bip352_secret_keys(root_key, &network, account)?;
+
+        let secp = Secp256k1::new();
+        let scan_public = PublicKey::from_secret_key(&secp, &scan_secret);
+        let spend_public = PublicKey::from_secret_key(&secp, &spend_secret);
+
+        Ok(Self {
+            scan_secret,
+            spend_secret,
+            scan_public,
+            spend_public,
+            network,
+        })
+    }
+
+    /// Restore directly from an already-built `Descriptor` — e.g. one
+    /// reloaded from storage via `Descriptor::new(storedString, ...)`.
+    ///
+    /// Reads `descriptor.key_map` directly (confirmed `pub` field). Takes
+    /// the first embedded secret key and applies the same root-safety
+    /// check as `from_descriptor_secret_key`.
+    ///
+    /// # Errors
+    /// `InvalidKeySilentPaymentException` if the descriptor is watch-only
+    /// (empty key_map), or if the embedded key fails the root-level check
+    /// (e.g. the descriptor string had a `[fingerprint/...]` origin prefix,
+    /// meaning the embedded key was already derived before being stored).
+    #[uniffi::constructor]
+    pub fn from_descriptor(
+        descriptor: &Descriptor,
+        network: Network,
+        account: u32,
+    ) -> Result<Self, SilentPaymentError> {
+        let bdk_secret_key =
+            descriptor
+                .key_map
+                .values()
+                .next()
+                .ok_or_else(|| SilentPaymentError::InvalidKey {
+                    msg: "Descriptor has no embedded secret key — it appears to be \
+                      watch-only (public-key-only). Silent Payments require \
+                      access to the private key material."
+                        .into(),
+                })?;
+        ensure_root_level(bdk_secret_key)?;
+
+        // Wrap the raw bdk_wallet key back into bdk-ffi's own FFI type so we
+        // can call its .derive() — the (pub(crate) BdkDescriptorSecretKey)
+        // tuple field, confirmed from keys.rs, makes this a plain
+        // same-crate constructor call, not a workaround.
+        let wrapped_root_key = DescriptorSecretKey(bdk_secret_key.clone());
+        let (scan_secret, spend_secret) =
+            derive_bip352_secret_keys(&wrapped_root_key, &network, account)?;
+
+        let secp = Secp256k1::new();
+        let scan_public = PublicKey::from_secret_key(&secp, &scan_secret);
+        let spend_public = PublicKey::from_secret_key(&secp, &spend_secret);
+
+        Ok(Self {
+            scan_secret,
+            spend_secret,
+            scan_public,
+            spend_public,
+            network,
+        })
     }
 
     /// Restore from raw private key hex strings.

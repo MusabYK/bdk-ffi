@@ -1,6 +1,6 @@
 use crate::error::{
     AddressParseError, Bip32Error, ExtractTxError, FeeRateError, FromScriptError, HashParseError,
-    PsbtError, PsbtParseError, TransactionError,
+    PsbtError, PsbtParseError, SchnorrSigError, TransactionError,
 };
 use crate::error::{ParseAmountError, PsbtFinalizeError};
 use crate::keys::DerivationPath;
@@ -21,6 +21,9 @@ use bdk_wallet::bitcoin::io::Cursor;
 use bdk_wallet::bitcoin::psbt::Input as BdkInput;
 use bdk_wallet::bitcoin::psbt::Output as BdkOutput;
 use bdk_wallet::bitcoin::secp256k1::Secp256k1;
+
+use bdk_wallet::bitcoin::sighash::{Prevouts, SighashCache, TapSighashType as BdkTapSighashType};
+
 use bdk_wallet::bitcoin::taproot::LeafNode as BdkLeafNode;
 use bdk_wallet::bitcoin::taproot::NodeInfo as BdkNodeInfo;
 use bdk_wallet::bitcoin::taproot::TapTree as BdkTapTree;
@@ -39,8 +42,11 @@ use bdk_wallet::bitcoin::Wtxid as BitcoinWtxid;
 use bdk_wallet::miniscript::psbt::PsbtExt;
 use bdk_wallet::serde_json;
 
+use bitcoin_hashes::Hash;
+use secp256k1::{schnorr, SecretKey};
+
 use std::collections::HashMap;
-use std::convert::TryFrom;
+use std::convert::{TryFrom, TryInto};
 use std::fmt::Display;
 use std::fs::File;
 use std::io::{BufReader, BufWriter};
@@ -51,6 +57,194 @@ use std::sync::{Arc, Mutex};
 pub type DescriptorType = bdk_wallet::miniscript::descriptor::DescriptorType;
 pub type Network = bdk_wallet::bitcoin::Network;
 pub(crate) type NetworkKind = bdk_wallet::bitcoin::NetworkKind;
+
+fn hex_to_32_bytes_schnorr(s: &str) -> Result<[u8; 32], SchnorrSigError> {
+    hex::decode(s)
+        .map_err(|e| SchnorrSigError::InvalidMessage {
+            error_message: e.to_string(),
+        })?
+        .try_into()
+        .map_err(|_| SchnorrSigError::InvalidMessage {
+            error_message: format!("Expected 32 bytes (64 hex chars): {s}"),
+        })
+}
+
+/// mirrors bitcoin::sighash::TapSighashType exactly
+/// Sighash types valid for Taproot inputs (BIP-341).
+///
+/// `Default` is Taproot-specific, it behaves like `All` but is encoded as
+/// an implicit (omitted) byte in the signature rather than an explicit
+/// 0x01, and is the recommended type for keypath spends.
+#[derive(uniffi::Enum, Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TapSighashType {
+    Default,
+    All,
+    None,
+    Single,
+    AllPlusAnyoneCanPay,
+    NonePlusAnyoneCanPay,
+    SinglePlusAnyoneCanPay,
+}
+
+impl From<TapSighashType> for BdkTapSighashType {
+    fn from(t: TapSighashType) -> Self {
+        match t {
+            TapSighashType::Default => BdkTapSighashType::Default,
+            TapSighashType::All => BdkTapSighashType::All,
+            TapSighashType::None => BdkTapSighashType::None,
+            TapSighashType::Single => BdkTapSighashType::Single,
+            TapSighashType::AllPlusAnyoneCanPay => BdkTapSighashType::AllPlusAnyoneCanPay,
+            TapSighashType::NonePlusAnyoneCanPay => BdkTapSighashType::NonePlusAnyoneCanPay,
+            TapSighashType::SinglePlusAnyoneCanPay => BdkTapSighashType::SinglePlusAnyoneCanPay,
+        }
+    }
+}
+
+/// Sign a 32-byte sighash with a raw secp256k1 private key using BIP-340
+/// Schnorr signing.
+///
+/// Returns a 64-byte BIP-340 Schnorr signature (128 hex chars) suitable for a P2TR keypath
+/// witness. — the sole witness element for a Taproot keypath spend.
+/// The sighash must be the BIP-341 Taproot sighash for the input
+///
+/// # Nonce generation
+/// Uses `sign_schnorr_no_aux_rand` — deterministic, no auxiliary
+/// randomness. Avoids requiring the `rand-std` feature (which needs
+/// `ThreadRng`) and keeps signing reproducible. BIP-340 signatures without
+/// aux-rand are fully valid; the aux-rand variant only adds side-channel/
+/// fault-injection hardening, which matters most for hardware signers.
+///
+/// USECASE: Sign a Taproot sighash with a BIP-352 spending key.
+///
+/// Produces a 64-byte BIP-340 Schnorr signature suitable for a P2TR keypath
+/// witness. The sighash must be the BIP-341 Taproot sighash for the input
+///
+/// # Why no additional Taproot tweak is applied here
+///
+/// BIP-352 defines d_k = b_spend + [label_scalar] + t_k as the effective
+/// Taproot SIGNING key, the key whose public point d_k × G equals the P2TR
+/// output key P_k that appears in the scriptPubKey. BIP-340 Schnorr signing
+/// requires the private key corresponding to the x-only output key; d_k IS
+/// that key. No further BIP-341 TapTweak is applied.
+///
+/// # Arguments
+/// * `spending_key` : SpendableOutput.spending_key (Phase 2 output).
+/// * `sighash_hex`  : 32-byte BIP-341 Taproot sighash (64 hex chars).
+///
+/// # Returns
+/// 64-byte Schnorr signature (128 hex chars). Parity negation is applied
+/// internally per BIP-340 if the key's Y coordinate is odd.
+///
+/// # Nonce generation
+/// Uses `sign_schnorr_no_aux_rand` — deterministic nonce derivation with no
+/// auxiliary randomness, so the same (key, sighash) pair always produces the
+/// same signature. This avoids requiring secp256k1's `rand-std` feature
+/// (which needs `ThreadRng`) and keeps signing reproducible in tests. BIP-340
+/// signatures without aux-rand are fully valid and verify identically; the
+/// aux-rand variant only adds side-channel/fault-injection hardening, which
+/// matters most for hardware-signer contexts, not typical software wallets.
+#[uniffi::export]
+pub fn sign_taproot_sighash(
+    spending_key_hex: String,
+    sighash_hex: String,
+) -> Result<String, SchnorrSigError> {
+    let key_bytes = hex::decode(&spending_key_hex).map_err(|e| SchnorrSigError::InvalidKey {
+        error_message: e.to_string(),
+    })?;
+    let spending_key =
+        SecretKey::from_slice(&key_bytes).map_err(|e| SchnorrSigError::InvalidKey {
+            error_message: e.to_string(),
+        })?;
+
+    let secp = Secp256k1::signing_only();
+    // Keypair wraps the private key. sign_schnorr_no_aux_rand follows BIP-340:
+    // if the resulting public key's Y coordinate is odd, the private key is
+    // negated internally before signing, ensuring an even-Y output key.
+    let keypair = secp256k1::Keypair::from_secret_key(&secp, &spending_key);
+
+    let msg = secp256k1::Message::from_digest_slice(&hex_to_32_bytes_schnorr(&sighash_hex)?)
+        .map_err(|e| SchnorrSigError::InvalidMessage {
+            error_message: e.to_string(),
+        })?;
+
+    // BIP-340 Schnorr signature — 64 bytes, deterministic (no aux rand)
+    let sig = secp.sign_schnorr_no_aux_rand(&msg, &keypair);
+    Ok(hex::encode(sig.as_ref()))
+}
+
+/// Verify a BIP-340 Schnorr signature.
+///
+/// `pubkey_hex` accepts either the 33-byte compressed form (66 hex chars,
+/// 02/03 prefix) or the 32-byte x-only form (64 hex chars) — the form a
+/// P2TR scriptPubKey actually carries.
+///
+/// # Arguments
+/// * `signature_hex` : 64-byte Schnorr sig (128 hex chars).
+/// * `sighash_hex`   : The 32-byte message that was signed (64 hex chars).
+/// * `pubkey_hex`    : 33-byte compressed (66 chars) OR 32-byte x-only (64 chars).
+#[uniffi::export]
+pub fn verify_schnorr_signature(
+    signature_hex: String,
+    sighash_hex: String,
+    pubkey_hex: String,
+) -> Result<bool, SchnorrSigError> {
+    let sig_bytes: [u8; 64] = hex::decode(&signature_hex)
+        .map_err(|e| SchnorrSigError::InvalidSignature {
+            error_message: e.to_string(),
+        })?
+        .try_into()
+        .map_err(|_| SchnorrSigError::InvalidSignature {
+            error_message: "Schnorr signature must be 64 bytes (128 hex chars)".into(),
+        })?;
+    let sig = schnorr::Signature::from_slice(&sig_bytes).map_err(|e| {
+        SchnorrSigError::InvalidSignature {
+            error_message: e.to_string(),
+        }
+    })?;
+
+    let msg = secp256k1::Message::from_digest_slice(&hex_to_32_bytes_schnorr(&sighash_hex)?)
+        .map_err(|e| SchnorrSigError::InvalidMessage {
+            error_message: e.to_string(),
+        })?;
+
+    let x_only = match pubkey_hex.len() {
+        66 => {
+            let bytes = hex::decode(&pubkey_hex).map_err(|e| SchnorrSigError::InvalidKey {
+                error_message: e.to_string(),
+            })?;
+            secp256k1::XOnlyPublicKey::from_slice(&bytes[1..]).map_err(|e| {
+                SchnorrSigError::InvalidKey {
+                    error_message: e.to_string(),
+                }
+            })?
+        }
+        64 => {
+            let bytes: [u8; 32] = hex::decode(&pubkey_hex)
+                .map_err(|e| SchnorrSigError::InvalidKey {
+                    error_message: e.to_string(),
+                })?
+                .try_into()
+                .map_err(|_| SchnorrSigError::InvalidKey {
+                    error_message: "x-only pubkey must be exactly 32 bytes".into(),
+                })?;
+            secp256k1::XOnlyPublicKey::from_slice(&bytes).map_err(|e| {
+                SchnorrSigError::InvalidKey {
+                    error_message: e.to_string(),
+                }
+            })?
+        }
+        n => {
+            return Err(SchnorrSigError::InvalidKey {
+                error_message: format!(
+                    "pubkey_hex must be 64 chars (x-only) or 66 chars (compressed), got {n}"
+                ),
+            })
+        }
+    };
+
+    let secp = Secp256k1::verification_only();
+    Ok(secp.verify_schnorr(&sig, &msg, &x_only).is_ok())
+}
 
 /// What kind of network we are on.
 #[uniffi::remote(Enum)]
@@ -651,7 +845,7 @@ pub struct TapScriptSigKey {
 }
 
 /// A key-value map for an input of the corresponding index in the unsigned transaction.
-#[derive(Clone, Debug, uniffi::Record)]
+#[derive(Clone, Debug, Default, uniffi::Record)]
 pub struct Input {
     /// The non-witness transaction this input spends from. Should only be
     /// `Option::Some` for inputs which spend non-segwit outputs or
@@ -1531,6 +1725,78 @@ impl Psbt {
     pub fn output(&self) -> Vec<Output> {
         let psbt = self.0.lock().unwrap();
         psbt.outputs.iter().map(|o| o.into()).collect()
+    }
+
+    /// Computes the BIP-341 Taproot key-spend sighash for a given input.
+    ///
+    /// Returns the 32-byte sighash message as hex (64 chars), sign this
+    /// directly with a BIP-340 Schnorr signature to produce a valid Taproot
+    /// keypath witness. The result is the same "message" a caller would
+    /// pass to a raw Schnorr-signing primitive.
+    ///
+    /// # Requirements (BIP-341, not a limitation of this method)
+    /// Taproot sighash computation requires the previous output (value +
+    /// scriptPubKey) of EVERY input in the transaction, not just the one
+    /// being signed, this is intentional: it's what makes Taproot
+    /// signatures commit to the full set of coins being spent, closing a
+    /// class of cross-input issues legacy sighashing didn't cover. Every
+    /// input's PSBT entry must have `witness_utxo` (or `non_witness_utxo`)
+    /// populated. Inputs BDK's own `TxBuilder` selects already have this;
+    /// foreign inputs added via `add_foreign_utxo` (e.g. a Silent Payments
+    /// output, or any UTXO outside the wallet's own descriptor) must have
+    /// `witness_utxo` set explicitly when constructing the `Input`.
+    ///
+    /// # Arguments
+    /// * `input_index` : which input to compute the sighash for.
+    /// * `sighash_type` : `TapSighashType::Default` if not given, the type
+    ///   virtually all Taproot keypath spends should use.
+    ///
+    /// # Errors
+    /// `PsbtError::PsbtUtxoOutOfBounds` if `input_index` is out of range.
+    /// `PsbtError::MissingUtxo` if any input lacks witness_utxo/non_witness_utxo
+    /// Note this is checked across ALL inputs, not just `input_index`,
+    /// per the BIP-341 requirement above.
+    /// `PsbtError::TaprootSighash` for any other sighash-computation failure
+    /// (e.g. `input_index` doesn't correspond to a Taproot-spendable output).
+    pub fn taproot_key_spend_sighash(
+        &self,
+        input_index: u32,
+        sighash_type: Option<TapSighashType>,
+    ) -> Result<String, PsbtError> {
+        let psbt = self.0.lock().unwrap();
+        let input_index = input_index as usize;
+
+        if input_index >= psbt.inputs.len() {
+            return Err(PsbtError::PsbtUtxoOutOfBounds);
+        }
+
+        // Gather every input's previous output. Required by BIP-341 even
+        // though only `input_index` is being signed, spend_utxo() already
+        // handles the witness_utxo vs non_witness_utxo distinction, reused
+        // here rather than reimplemented.
+        let mut prevouts = Vec::with_capacity(psbt.inputs.len());
+        for i in 0..psbt.inputs.len() {
+            let utxo = psbt.spend_utxo(i).map_err(|_| PsbtError::MissingUtxo)?;
+            prevouts.push(utxo.clone());
+        }
+
+        let sighash_type = sighash_type
+            .map(BdkTapSighashType::from)
+            .unwrap_or(BdkTapSighashType::Default);
+        let prevouts = Prevouts::All(&prevouts);
+
+        // SighashCache::new() accepts any Borrow<Transaction> — a plain
+        // immutable reference is enough here since we only read (no
+        // witness_mut() call).
+        let mut cache = SighashCache::new(&psbt.unsigned_tx);
+        let sighash = cache
+            .taproot_key_spend_signature_hash(input_index, &prevouts, sighash_type)
+            .map_err(|e| PsbtError::TaprootSighash {
+                error_message: e.to_string(),
+            })?;
+
+        Ok(hex::encode(sighash.to_byte_array()))
+        // Ok(hex::encode(sighash.as_byte_array()))
     }
 }
 

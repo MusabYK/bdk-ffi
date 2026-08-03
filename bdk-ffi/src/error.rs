@@ -604,6 +604,17 @@ pub enum PreV1MigrationError {
     InvalidChecksum { error_message: String },
 }
 
+/// Schnorr Signing error type
+#[derive(Debug, thiserror::Error, uniffi::Error)]
+pub enum SchnorrSigError {
+    #[error("Invalid key: {error_message}")]
+    InvalidKey { error_message: String },
+    #[error("Invalid signature: {error_message}")]
+    InvalidSignature { error_message: String },
+    #[error("Invalid message: {error_message}")]
+    InvalidMessage { error_message: String },
+}
+
 #[derive(Debug, thiserror::Error, uniffi::Error)]
 pub enum PsbtError {
     #[error("invalid magic")]
@@ -617,6 +628,9 @@ pub enum PsbtError {
 
     #[error("output index is out of bounds of non witness script output array")]
     PsbtUtxoOutOfBounds,
+
+    #[error("taproot sighash computation failed: {error_message}")]
+    TaprootSighash { error_message: String },
 
     #[error("invalid key: {key}")]
     InvalidKey { key: String },

@@ -10,9 +10,21 @@ use sp_lib::{
     Network as SpNetwork, SilentPaymentAddress as SpAddress, SpVersion,
 };
 
+use crate::bitcoin::sign_taproot_sighash as bitcoin_sign_taproot_sighash;
+use bdk_wallet::bitcoin::sighash::TapSighashType as BdkTapSighashType;
+use bdk_wallet::bitcoin::taproot::Signature as TaprootSignature;
+use bdk_wallet::bitcoin::Weight;
+use bdk_wallet::bitcoin::Witness;
+use secp256k1::schnorr;
+
+use crate::bitcoin::{Amount, Input, OutPoint, Psbt, Script, TxOut};
+use crate::tx_builder::TxBuilder;
+use crate::wallet::Wallet;
+use crate::FeeRate;
+
 use crate::bitcoin::NetworkKind;
 use crate::descriptor::Descriptor;
-use crate::error::{Bip32Error, Bip39Error, DescriptorKeyError};
+use crate::error::{Bip32Error, Bip39Error, DescriptorKeyError, SchnorrSigError};
 use crate::keys::{DerivationPath, DescriptorSecretKey, Mnemonic};
 
 // Only needed now for the internal root-safety check (origin/depth inspection).
@@ -102,6 +114,14 @@ impl From<Bip39Error> for SilentPaymentError {
     }
 }
 
+// SpendableOutput.sign() surfaces SchnorrSigError from
+impl From<SchnorrSigError> for SilentPaymentError {
+    fn from(e: SchnorrSigError) -> Self {
+        SilentPaymentError::CryptoError {
+            msg: format!("Signing failed: {e}"),
+        }
+    }
+}
 /// A BIP-352 Silent Payment address with component public keys.
 /// sp1q... (mainnet) or tsp1q... (testnet/signet) — bech32m encoded.
 #[derive(uniffi::Record, Debug, Clone)]
@@ -168,8 +188,6 @@ pub struct SendingInput {
     /// Output index of the UTXO (the "n" in txid:n)
     pub vout: u32,
 }
-
-// Root-key safety check + derivation
 
 /// Verify a raw BdkDescriptorSecretKey is genuinely root-level before it's
 /// used for BIP-352 derivation.
@@ -476,12 +494,265 @@ impl SpendableOutput {
     pub fn output_pubkey_hex(&self) -> String {
         hex::encode(self.output_pubkey.serialize())
     }
+
+    /// Compute the 34-byte P2TR scriptPubKey for a Silent Payment output.
+    ///
+    /// Formula: OP_1 (0x51) OP_PUSHBYTES_32 (0x20) <x_only_pubkey_32_bytes>
+    /// # Returns
+    /// 68-char hex string, always starting with "5120".
+    /// Use this when building the PSBT input to verify the UTXO's scriptPubKey.
+    pub fn script_pubkey(&self) -> String {
+        let bytes = self.output_pubkey.serialize();
+        format!("5120{}", hex::encode(&bytes[1..]))
+    }
+
+    /// Sign a Taproot sighash with this output's spending key.
+    /// # Returns
+    /// 64-char hex string of the 64-byte Schnorr signature.
+    pub fn sign(&self, sighash_hex: String) -> Result<String, SchnorrSigError> {
+        bitcoin_sign_taproot_sighash(hex::encode(self.spending_key.secret_bytes()), sighash_hex)
+    }
 }
 
-/// Full BIP-352 keypair (scan secret + spend secret).
+/// One entry in the pool of discovered Silent Payment outputs a caller
+/// wants available for selection.
+///
+/// # Arguments
+/// `spendable` : from `derive_spending_key`: the private key
+///   and output pubkey for this specific SP payment. is expected to already be the result of
+/// `SilentPaymentRecipient.derive_spending_key` for this specific payment
+/// `outpoint` : the SP output's location on-chain (txid + vout).
+/// `amount_sat` : the SP output's own value, i.e. what was received.
+#[derive(uniffi::Record, Clone)]
+pub struct SpendablePoolEntry {
+    pub outpoint: OutPoint,
+    pub amount_sats: u64,
+    pub spendable: Arc<SpendableOutput>,
+}
+
+/// Rough per-input vbyte cost for a Taproot keypath spend:
+///   non-witness: outpoint(36) + empty scriptSig varint(1) + sequence(4)
+///                = 41 bytes @ 4 WU/byte = 164 WU
+///   witness: item-count(1) + sig-length-prefix(1) + signature(64)
+///                = 66 bytes @ 1 WU/byte (segwit discount) = 66 WU
+///   total: 230 WU / 4 = 57.5 vbytes, rounded up.
+/// An estimate appropriate for simple/greedy selection — not a claim of
+/// byte-perfect accuracy the way BDK's own fee calculation is.
+const SP_INPUT_VBYTES_ESTIMATE: u64 = 58;
+
+/// Rough fixed overhead: version + locktime + input/output counts + one
+/// P2TR recipient output. Same caveat as above.
+const BASE_TX_VBYTES_ESTIMATE: u64 = 44;
+
+/// Spend from a pool of unspent discovered SP outputs to a single
+/// recipient, the way a normal wallet spends from balance rather than making
+/// the caller pick one specific UTXO. It selecting as many of `available_outputs` as needed —
+/// largest-first, to cover the requested amount (or all of them, in
+/// drain mode).
+///
+/// Builds a transaction whose inputs are drawn ENTIRELY from
+/// `available_outputs`, via `add_foreign_utxo` + `manually_selected_only`,
+/// the wallet's own tracked UTXOs are never touched or spent,  signs it with the derived
+/// spending key, and returns a broadcast-ready, fully-signed PSBT.
+///
+/// # Coin selection
+/// Largest-first: not BDK's own branch-and-bound selector (which has no
+/// visibility into foreign UTXOs regardless), a straightforward greedy
+/// strategy appropriate for "simple coin selection" — not claiming to
+/// minimize fees or input count the way a real selection algorithm would.
+///
+/// For a transaction combining an SP output with the wallet's own regular
+/// coins, should be built by the lower-level pieces directly instead of this helper.
+///
+/// # Arguments
+/// * `wallet` : any BDK wallet on the correct network. Its own UTXOs are
+///   NOT spent by this call; used for network validation and as the destination for
+///   change if `recipient_amount_sat` leaves any.
+/// * `available_outputs` : the pool to select from. Order doesn't matter;
+///   this function sorts by amount internally.
+/// * `recipient_script` : where to send the funds. Any scriptPubKey — the
+///   destination doesn't need to be another Silent Payment address.
+/// * `recipient_amount_sat` : `Some(amount)` sends exactly that much
+///   (leftover becomes wallet change). `None` drains everything
+///   (`amount_sat` minus fee) to `recipient_script`.
+/// * `fee_rate_sat_per_vb` : fee rate for the transaction.
+///
+/// # Returns
+/// A fully-signed `Psbt` — call `.extract_tx()` on it to get a
+/// broadcast-ready `Transaction`.
+///
+/// # Errors
+/// `SilentPaymentError::CryptoError` if `available_outputs` (summed)
+/// can't cover `recipient_amount_sat` plus the estimated fee, or if
+/// building/signing fails for any other reason.
+#[uniffi::export]
+pub fn spend_silent_payment_outputs(
+    wallet: &Arc<Wallet>,
+    available_outputs: Vec<SpendablePoolEntry>,
+    recipient_script: &Script,
+    recipient_amount_sat: Option<u64>,
+    fee_rate_sat_per_vb: u64,
+) -> Result<Arc<Psbt>, SilentPaymentError> {
+    if available_outputs.is_empty() {
+        return Err(SilentPaymentError::InvalidKey {
+            msg: "No spendable outputs provided".into(),
+        });
+    }
+
+    // Simple coin selection: largest-first
+    let mut sorted = available_outputs;
+    sorted.sort_by(|a, b| b.amount_sats.cmp(&a.amount_sats));
+
+    let target_sat = recipient_amount_sat.unwrap_or(0);
+    let mut selected: Vec<SpendablePoolEntry> = Vec::new();
+    let mut accumulated: u64 = 0;
+
+    for entry in sorted {
+        // Fee if THIS entry is included (selected.len() + 1 total inputs),
+        // computed before pushing so it reflects the count post-push.
+        let estimated_fee_sat = (BASE_TX_VBYTES_ESTIMATE
+            + SP_INPUT_VBYTES_ESTIMATE * (selected.len() as u64 + 1))
+            * fee_rate_sat_per_vb;
+
+        accumulated += entry.amount_sats;
+        selected.push(entry);
+
+        // Drain mode (recipient_amount_sat: None) takes every provided
+        // entry — "drain the pool" means the whole pool, not just enough
+        // of it to cover some amount.
+        if recipient_amount_sat.is_some() && accumulated >= target_sat + estimated_fee_sat {
+            break;
+        }
+    }
+
+    if let Some(target) = recipient_amount_sat {
+        let final_fee_estimate = (BASE_TX_VBYTES_ESTIMATE
+            + SP_INPUT_VBYTES_ESTIMATE * selected.len() as u64)
+            * fee_rate_sat_per_vb;
+        if accumulated < target + final_fee_estimate {
+            return Err(SilentPaymentError::CryptoError {
+                msg: format!(
+                    "Insufficient funds: need ~{} sats (amount + estimated fee), \
+                     only {} sats available across {} provided output(s)",
+                    target + final_fee_estimate,
+                    accumulated,
+                    selected.len()
+                ),
+            });
+        }
+    }
+
+    // ── Build: one add_foreign_utxo per selected pool entry ─────────────────
+    let mut tx_builder = Arc::new(TxBuilder::new());
+    for entry in &selected {
+        let script_hex = entry.spendable.script_pubkey();
+        let script_bytes = hex::decode(&script_hex)
+            .map_err(|e| SilentPaymentError::EncodingError { msg: e.to_string() })?;
+        let output_script = Arc::new(Script::new(script_bytes));
+        let txout = TxOut {
+            value: Arc::new(Amount::from_sat(entry.amount_sats)),
+            script_pubkey: output_script,
+        };
+        let psbt_input = Input {
+            witness_utxo: Some(txout),
+            ..Default::default()
+        };
+
+        tx_builder = tx_builder
+            .add_foreign_utxo(
+                entry.outpoint.clone(),
+                psbt_input,
+                Weight::from_wu(66).into(),
+            )
+            .map_err(|e| SilentPaymentError::CryptoError {
+                msg: format!("add_foreign_utxo failed for {}: {e}", entry.outpoint.txid),
+            })?;
+    }
+    tx_builder = tx_builder.manually_selected_only();
+
+    tx_builder = match recipient_amount_sat {
+        Some(amount) => {
+            tx_builder.add_recipient(recipient_script, Arc::new(Amount::from_sat(amount)))
+        }
+        None => tx_builder.drain_to(recipient_script),
+    };
+
+    let fee_rate = FeeRate::from_sat_per_vb(fee_rate_sat_per_vb).map_err(|e| {
+        SilentPaymentError::CryptoError {
+            msg: format!("Invalid fee rate: {e}"),
+        }
+    })?;
+    tx_builder = tx_builder.fee_rate(&fee_rate);
+
+    let psbt = tx_builder
+        .finish(wallet)
+        .map_err(|e| SilentPaymentError::CryptoError {
+            msg: format!("Transaction build failed: {e}"),
+        })?;
+
+    // ── Sign every selected input — the key generalization from the
+    //    single-output version this replaces (which only ever signed
+    //    index 0) ─────────────────────────────────────────────────────────
+    //
+    // Match by outpoint, not position: BDK's default BIP-69 ordering means
+    // input order in the finished psbt has no guaranteed relationship to
+    // the order `selected` was built in.
+    let input_count = {
+        let inner = psbt.0.lock().unwrap();
+        inner.unsigned_tx.input.len()
+    };
+
+    for input_index in 0..input_count {
+        let (txid_str, vout) = {
+            let inner = psbt.0.lock().unwrap();
+            let txin = &inner.unsigned_tx.input[input_index];
+            (
+                txin.previous_output.txid.to_string(),
+                txin.previous_output.vout,
+            )
+        };
+
+        let Some(entry) = selected
+            .iter()
+            .find(|e| e.outpoint.txid.to_string() == txid_str && e.outpoint.vout == vout)
+        else {
+            // Shouldn't happen given manually_selected_only(), but skip
+            // rather than fail outright if some other input ever appears.
+            continue;
+        };
+
+        // Compute the sighash and sign
+        let sighash_hex = psbt
+            .taproot_key_spend_sighash(input_index as u32, None)
+            .map_err(|e| SilentPaymentError::CryptoError {
+                msg: format!("Sighash computation failed for input {input_index}: {e}"),
+            })?;
+
+        let signature_hex = entry.spendable.sign(sighash_hex)?;
+
+        // Attach the signature
+        let sig_bytes = hex::decode(&signature_hex)
+            .map_err(|e| SilentPaymentError::EncodingError { msg: e.to_string() })?;
+        let schnorr_sig = schnorr::Signature::from_slice(&sig_bytes)
+            .map_err(|e| SilentPaymentError::CryptoError { msg: e.to_string() })?;
+        let taproot_sig = TaprootSignature {
+            signature: schnorr_sig,
+            sighash_type: BdkTapSighashType::Default,
+        };
+
+        let mut inner = psbt.0.lock().unwrap();
+        inner.inputs[input_index].tap_key_sig = Some(taproot_sig);
+        inner.inputs[input_index].final_script_witness =
+            Some(Witness::p2tr_key_spend(&taproot_sig));
+    }
+
+    Ok(psbt)
+}
+
+/// Full BIP-352 keypair (scan key + spend key).
 /// Generates SP addresses, derive labeled sub-addresses, export keys
 /// for SilentPaymentScanner.
-/// NOTE: Holds private keys, dispose() when done.
+/// NOTE: This holds private keys, dispose() when done.
 #[derive(uniffi::Object)]
 pub struct SilentPaymentRecipient {
     scan_secret: SecretKey,

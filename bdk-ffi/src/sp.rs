@@ -273,9 +273,9 @@ fn derive_bip352_secret_keys(
 ///
 /// /// # BIP-352 sending protocol
 /// ```text
-/// 1. For each P2TR input: if parity is ODD, negate the private key
+/// 1. For each P2TR input: if parity is ODD, negate the private key otherwise leave it unchanged
 /// 2. a_sum = sum of all (possibly negated) input private keys
-/// 3. A_sum = a_sum × G
+/// 3. A_sum = the sum of the input (UTXO) Public Keys a_sum × G
 /// 4. smallest_outpoint = lexicographically smallest (txid_le || vout_le) outpoint
 /// 5. input_hash = H_BIP0352/Inputs(smallest_outpoint || A_sum)
 /// 6. partial_secret = a_sum × input_hash         ← calculate_partial_secret()
@@ -283,6 +283,7 @@ fn derive_bip352_secret_keys(
 ///    shared_secret = partial_secret × B_scan     ← ECDH
 ///    t_k = H_BIP0352/SharedSecret(shared_secret || k)
 ///    P_k = B_spend + t_k × G                    ← output pubkey
+///    recipient calculate the spending private key for the output (P_k) as: p_k = b_spend + t_k (mod n)
 /// ```
 ///
 /// Steps 1–6 are handled by sp_lib::utils::sending::calculate_partial_secret.

@@ -255,12 +255,12 @@ fn derive_bip352_secret_keys(
 ) -> Result<(SecretKey, SecretKey), SilentPaymentError> {
     let coin_type = bip352_coin_type(network);
 
-    // m/352'/coin_type'/account'/0/0 — spend key
-    let spend_path = DerivationPath::new(format!("m/352h/{coin_type}h/{account}h/0/0"))?;
+    // m/352'/coin_type'/account'/0'/0 — spend key
+    let spend_path = DerivationPath::new(format!("m/352h/{coin_type}h/{account}h/0h/0"))?;
     let spend_key = root_key.derive(&spend_path)?;
 
-    // m/352'/coin_type'/account'/1/0 — scan key
-    let scan_path = DerivationPath::new(format!("m/352h/{coin_type}h/{account}h/1/0"))?;
+    // m/352'/coin_type'/account'/1'/0 — scan key
+    let scan_path = DerivationPath::new(format!("m/352h/{coin_type}h/{account}h/1h/0"))?;
     let scan_key = root_key.derive(&scan_path)?;
 
     let spend_secret = SecretKey::from_slice(&spend_key.secret_bytes())

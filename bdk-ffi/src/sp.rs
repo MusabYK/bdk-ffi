@@ -78,6 +78,12 @@ pub enum SilentPaymentError {
     CryptoError { msg: String },
     #[error("Encoding error: {msg}")]
     EncodingError { msg: String },
+    #[error(
+        "Exceeded K_max ({k_max}) same-scan-key matches in a single transaction — likely an \
+         adversarial transaction crafted to force excess scanning work (BIP-352 per-group \
+         recipient limit)"
+    )]
+    ScanLimitExceeded { k_max: u32 },
 }
 
 impl From<sp_lib::Error> for SilentPaymentError {
@@ -1044,6 +1050,12 @@ impl SilentPaymentRecipient {
     }
 }
 
+/// BIP-352 per-group recipient limit. BIP-352 caps this at 2323
+/// (the most taproot outputs that fit in a 100kvB tx built from the cheapest
+/// eligible input) specifically to bound that cost. Once a scan for one
+/// transaction matches this many same-scan-key outputs, treat it as suspicious
+/// and stop rather than keep scanning.
+const K_MAX: u32 = 2323;
 /// Watch-only BIP-352 scanner. This holds scan secret + spend pubkey only.
 /// Cannot spend, it's safe for background services and servers.
 #[derive(uniffi::Object)]
@@ -1169,6 +1181,9 @@ impl SilentPaymentScanner {
                     label: None,
                 });
                 k += 1;
+                if k > K_MAX {
+                    return Err(SilentPaymentError::ScanLimitExceeded { k_max: K_MAX });
+                }
             } else {
                 break;
             }
@@ -1267,6 +1282,9 @@ impl SilentPaymentScanner {
                 break;
             }
             k += 1;
+            if k > K_MAX {
+                return Err(SilentPaymentError::ScanLimitExceeded { k_max: K_MAX });
+            }
         }
 
         // Return payments in the order they appeared in the transaction

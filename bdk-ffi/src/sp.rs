@@ -759,7 +759,8 @@ pub fn spend_silent_payment_outputs(
 /// Full BIP-352 keypair (scan key + spend key).
 /// Generates SP addresses, derive labeled sub-addresses, export keys
 /// for SilentPaymentScanner.
-/// NOTE: This holds private keys, dispose() when done.
+/// NOTE: This holds both private keys for as long as the caller keeps a
+/// reference to it, dispose when done.
 #[derive(uniffi::Object)]
 pub struct SilentPaymentRecipient {
     scan_secret: SecretKey,
@@ -1058,6 +1059,16 @@ impl SilentPaymentRecipient {
 const K_MAX: u32 = 2323;
 /// Watch-only BIP-352 scanner. This holds scan secret + spend pubkey only.
 /// Cannot spend, it's safe for background services and servers.
+///
+/// Two backend models are supported, caller's choice:
+///   * Local / tweak-index-server (e.g. BlindBit-style): the server serves
+///     only the generic per-transaction tweak data; `scan_secret` never
+///     leaves this device. Use [`SilentPaymentScanner::scan_transaction`] /
+///     [`SilentPaymentScanner::scan_transaction_with_labels`].
+///   * Frigate: the server does the full match and needs the scan secret
+///     key itself. Use `SilentPaymentRecipient::export_scan_secret_hex` +
+///     `export_spend_pubkey_hex` to get what Frigate's `subscribe()` wants,
+///     and this type isn't involved in that path at all.
 #[derive(uniffi::Object)]
 pub struct SilentPaymentScanner {
     scan_secret: SecretKey,
@@ -1123,12 +1134,11 @@ impl SilentPaymentScanner {
     ///   the tweak index server. The server does the input hash computation;
     ///   we only do the ECDH + output derivation.
     ///
-    ///   In full-verification mode (no server), pass the raw sender input
-    ///   pubkeys and use [`scan_transaction_full`] which also takes outpoints.
+    ///   Full-verification mode (no server, raw sender input pubkeys + outpoints,
+    ///   input hash computed locally) is not implemented in this file yet — only
+    ///   the light-client/precomputed-tweak path below exists so far.
     ///
     /// * `tx_output_pubkeys_hex` — 33-byte compressed pubkeys from tx outputs.
-    ///
-    /// * `output_amounts_sats` — Parallel with output pubkeys.
     ///
     /// # BIP-352 computation (correct)
     ///
@@ -1289,7 +1299,7 @@ impl SilentPaymentScanner {
 
         // Return payments in the order they appeared in the transaction
         // Sort by output index to match expected order
-        //payments.sort_by_key(|p| p.output_index);
+        payments.sort_by_key(|p| p.output_index);
 
         Ok(ScanTransactionResult { payments })
     }
